@@ -289,7 +289,11 @@ def month_to_number(val):
 
 
 def detect_category_columns(df: pd.DataFrame, exclude: list) -> list:
-    """Deteksi kolom kategorikal: object/string dengan unique value terbatas."""
+    """Deteksi kolom kategorikal: object/string dengan unique value TERBATAS
+    (<= CATEGORY_MAX_UNIQUE). Dipakai KHUSUS untuk sidebar Category Filter
+    (checkbox), supaya sidebar nggak kebanjiran ratusan/ribuan checkbox
+    kalau ada kolom dengan unique value yang sangat banyak (misal nama
+    kapal, nama customer, dst)."""
     cat_cols = []
     for col in df.columns:
         if col in exclude:
@@ -299,6 +303,23 @@ def detect_category_columns(df: pd.DataFrame, exclude: list) -> list:
             if 0 < n_unique <= CATEGORY_MAX_UNIQUE:
                 cat_cols.append(col)
     return cat_cols
+
+
+def detect_all_text_columns(df: pd.DataFrame, exclude: list) -> list:
+    """Semua kolom teks TANPA batas jumlah unique value - dipakai untuk
+    dropdown single-select di mana-mana (Category Analysis, Distribution,
+    Group Comparison, Kelompokkan Nilai, Summary breakdown, dll) yang aman
+    nampung ribuan pilihan sekalipun karena cuma dropdown biasa, bukan
+    checkbox. BEDA dari detect_category_columns yang sengaja dibatasi
+    CATEGORY_MAX_UNIQUE khusus buat sidebar Category Filter."""
+    cols = []
+    for col in df.columns:
+        if col in exclude:
+            continue
+        if is_text_dtype(df[col]) or str(df[col].dtype).startswith("category"):
+            if df[col].nunique(dropna=True) > 0:
+                cols.append(col)
+    return cols
 
 
 ID_NAME_PATTERN = re.compile(
@@ -728,12 +749,21 @@ def load_and_process(file_bytes: bytes, sheet_name, header_row: int = 0,
     # (misal Contract Ref.No). id_like_cols tetap disimpan terpisah di meta
     # untuk dipakai khusus di dropdown breakdown pada section Summary.
 
+    # all_text_cols: SEMUA kolom teks TANPA batas CATEGORY_MAX_UNIQUE, dipakai
+    # buat dropdown single-select di Category Analysis/Distribution/Group
+    # Comparison/Kelompokkan Nilai/Summary, supaya kolom dengan unique value
+    # sangat banyak (misal Vessel Name, Customer Name) TETAP muncul di
+    # pilihan itu, walau nggak muncul sebagai checkbox di sidebar Category
+    # Filter (yang emang sengaja dibatasi CATEGORY_MAX_UNIQUE).
+    all_text_cols = detect_all_text_columns(df, exclude=list(exclude_from_category))
+
     meta = {
         "date_cols": date_cols,
         "year_cols": year_cols,
         "month_cols": month_cols,
         "numeric_cols": numeric_cols,
         "category_cols": category_cols,
+        "all_text_cols": all_text_cols,
         "id_like_cols": id_like_cols,
         "serial_cols": serial_cols,
         "derived_month_col": derived_month_col,
@@ -793,9 +823,16 @@ with st.expander("🧭 Cek & Atur Baris Header (kalau ada kolom 'Unnamed' / tota
         io.BytesIO(file_bytes), sheet_name=selected_sheet, header=None, nrows=10
     )
     st.dataframe(raw_preview, use_container_width=True)
+    # PENTING: key di sini diberi suffix nama sheet (f"...{selected_sheet}")
+    # supaya widget-nya RESET tiap ganti sheet. Tanpa key unik ini, Streamlit
+    # menganggap widget yang sama terus dan nilai "value=" default TIDAK
+    # ke-apply lagi setelah interaksi pertama - jadi kalau kamu pindah sheet,
+    # angka header row-nya "nyangkut" ke nilai sheet sebelumnya, dan bisa
+    # bikin kolom-kolom sheet yang baru salah baca / kelihatan hilang.
     header_row = st.number_input(
         "Baris ke berapa (mulai dari 0) yang jadi header?",
         min_value=0, max_value=100, value=guessed_header_row, step=1,
+        key=f"header_row_input_{selected_sheet}",
     )
     st.markdown("---")
     st.caption(
@@ -827,6 +864,7 @@ year_cols = meta["year_cols"]
 month_cols = meta["month_cols"]
 numeric_cols = meta["numeric_cols"]
 category_cols = meta["category_cols"]
+all_text_cols = meta["all_text_cols"]
 id_like_cols = meta["id_like_cols"]
 serial_cols = meta["serial_cols"]
 
@@ -853,13 +891,14 @@ if hidden_cols:
     month_cols = [c for c in month_cols if c not in hidden_cols]
     numeric_cols = [c for c in numeric_cols if c not in hidden_cols]
     category_cols = [c for c in category_cols if c not in hidden_cols]
+    all_text_cols = [c for c in all_text_cols if c not in hidden_cols]
     id_like_cols = [c for c in id_like_cols if c not in hidden_cols]
 
 # -----------------------------------------------------------------
 # Panel debug: tunjukkan hasil deteksi kolom apa adanya, supaya user
 # bisa cek langsung kalau ada kolom yang tidak terbaca sesuai harapan.
 # -----------------------------------------------------------------
-all_detected = set(date_cols) | set(year_cols) | set(month_cols) | set(numeric_cols) | set(category_cols)
+all_detected = set(date_cols) | set(year_cols) | set(month_cols) | set(numeric_cols) | set(all_text_cols)
 undetected_cols = [c for c in df_raw.columns if c not in all_detected]
 
 with st.expander("🔍 Kolom Terdeteksi dari File Ini (klik untuk cek)", expanded=False):
@@ -868,6 +907,15 @@ with st.expander("🔍 Kolom Terdeteksi dari File Ini (klik untuk cek)", expande
             f"ℹ️ Kolom nomor urut murni terdeteksi: **{', '.join(serial_cols)}** — "
             f"kolom ini DIABAIKAN saat cek baris duplikat, supaya baris yang datanya "
             f"sama persis (cuma beda nomor urut) tetap kehitung sebagai duplikat."
+        )
+    text_cols_over_limit = [c for c in all_text_cols if c not in category_cols]
+    if text_cols_over_limit:
+        st.info(
+            f"ℹ️ Kolom teks dengan unique value > {CATEGORY_MAX_UNIQUE} terdeteksi: "
+            f"**{', '.join(text_cols_over_limit)}** — kolom ini TIDAK muncul sebagai "
+            f"checkbox di sidebar Category Filter (biar sidebar nggak kebanjiran), "
+            f"tapi TETAP tersedia penuh di dropdown Category Analysis, Distribution, "
+            f"Group Comparison, Kelompokkan Nilai, dan Summary breakdown."
         )
     d1, d2, d3 = st.columns(3)
     d1.markdown("**📅 Date Columns**")
@@ -880,10 +928,10 @@ with st.expander("🔍 Kolom Terdeteksi dari File Ini (klik untuk cek)", expande
     d2.write(numeric_cols if numeric_cols else "-")
     d2.markdown("**🆔 ID / Reference Columns** (numeric tapi bukan buat ditotal)")
     d2.write(id_like_cols if id_like_cols else "-")
-    d3.markdown("**🏷️ Category Columns**")
-    d3.write(category_cols if category_cols else "-")
+    d3.markdown("**🏷️ Text/Category Columns** (semua, termasuk unique value banyak)")
+    d3.write(all_text_cols if all_text_cols else "-")
     if undetected_cols:
-        st.markdown("**⚠️ Belum masuk kategori manapun** (kemungkinan unique value terlalu banyak, atau tipe data campur):")
+        st.markdown("**⚠️ Belum masuk kategori manapun** (kemungkinan tipe data campur):")
         st.write(undetected_cols)
 
 # -----------------------------------------------------------------
@@ -966,7 +1014,7 @@ with st.sidebar:
         )
         group_source_col = st.selectbox(
             "Kolom SUMBER (yang mau dikelompokkan ulang)",
-            options=["(Tidak dipakai)"] + category_cols,
+            options=["(Tidak dipakai)"] + all_text_cols,
             key="group_source_col",
         )
 
@@ -988,7 +1036,7 @@ with st.sidebar:
 
             st.markdown("**➕ Buat grup baru:**")
 
-            other_cols_for_target = [c for c in category_cols if c != group_source_col]
+            other_cols_for_target = [c for c in all_text_cols if c != group_source_col]
             target_options = ["Simpan sebagai kolom baru khusus"] + [
                 f"{c}  (gabungkan ke kolom ini)" for c in other_cols_for_target
             ]
@@ -1059,6 +1107,8 @@ for src_col, groups in st.session_state.custom_groups.items():
         df_raw[new_col_name] = df_raw[src_col].astype(str).map(mapping).fillna(df_raw[src_col].astype(str))
         if new_col_name not in category_cols:
             category_cols.append(new_col_name)
+        if new_col_name not in all_text_cols:
+            all_text_cols.append(new_col_name)
 
     for g in merge_groups:
         target_col = g["target_col"]
@@ -1138,7 +1188,11 @@ with st.sidebar:
                 df_filtered = df_filtered[mask | df_filtered[date_col].isna()]
 
     # -----------------------------------------------------------------
-    # B. CATEGORY FILTER
+    # B. CATEGORY FILTER (checkbox) - SENGAJA tetap pakai category_cols
+    # yang dibatasi CATEGORY_MAX_UNIQUE, biar sidebar nggak kebanjiran
+    # ratusan/ribuan checkbox kalau ada kolom dengan unique value banyak
+    # (misal Vessel Name). Kolom seperti itu tetap bisa dipakai penuh di
+    # dropdown lain (Category Analysis, Distribution, dst) via all_text_cols.
     # -----------------------------------------------------------------
     if category_cols:
         with st.expander("🏷️ Category Filter", expanded=True):
@@ -1268,8 +1322,8 @@ kpi_cols[1].metric("Total Columns", f"{df_filtered.shape[1]:,}")
 kpi_cols[2].metric("Numeric Columns", f"{len(numeric_cols):,}")
 kpi_cols[3].metric("Date Columns", f"{len(date_cols):,}")
 
-total_unique_categories = sum(df_filtered[c].nunique(dropna=True) for c in category_cols) \
-    if category_cols else 0
+total_unique_categories = sum(df_filtered[c].nunique(dropna=True) for c in all_text_cols) \
+    if all_text_cols else 0
 kpi_cols[4].metric("Unique Categories", f"{total_unique_categories:,}")
 
 if numeric_cols:
@@ -1303,11 +1357,12 @@ st.caption(
 )
 
 if numeric_cols:
-    # Opsi breakdown: kolom kategori biasa (Company, Country, dll) DIGABUNG
-    # dengan kolom ID/reference number (Contract Ref.No, Shipment No., dll)
-    # yang meski bertipe numeric, secara makna adalah identifier -> tetap
-    # perlu bisa dipakai buat breakdown/total per kelompok.
-    breakdown_options = category_cols + [c for c in id_like_cols if c not in category_cols]
+    # Opsi breakdown: SEMUA kolom teks (all_text_cols, tanpa batas unique
+    # value) DIGABUNG dengan kolom ID/reference number (Contract Ref.No,
+    # Shipment No., dll) yang meski bertipe numeric, secara makna adalah
+    # identifier -> tetap perlu bisa dipakai buat breakdown/total per
+    # kelompok, termasuk kolom yang unique value-nya banyak (Vessel Name dst).
+    breakdown_options = all_text_cols + [c for c in id_like_cols if c not in all_text_cols]
 
     s1, s2, s3 = st.columns([2, 1.3, 2])
 
@@ -1335,8 +1390,9 @@ if numeric_cols:
             "Breakdown per (opsional)",
             options=["(Tidak di-breakdown / Grand Total saja)"] + breakdown_options,
             key="summary_breakdown",
-            help="Bisa pilih kolom kategori (Company, Country) ATAU kolom ID/reference "
-                 "seperti Contract Ref.No — cocok kalau 1 nilai kolom itu muncul di banyak baris.",
+            help="Bisa pilih kolom kategori apapun (Company, Country, Vessel Name, dst) ATAU "
+                 "kolom ID/reference seperti Contract Ref.No — cocok kalau 1 nilai kolom itu "
+                 "muncul di banyak baris.",
         )
 
     if summary_value_cols:
@@ -1470,10 +1526,10 @@ with tabs[0]:
 # B. CATEGORY ANALYSIS
 # -----------------------------------------------------------------
 with tabs[1]:
-    if category_cols and numeric_cols:
+    if all_text_cols and numeric_cols:
         cc1, cc2, cc3 = st.columns(3)
         with cc1:
-            cat_col = st.selectbox("Pilih Category", category_cols, key="cat_col_bar")
+            cat_col = st.selectbox("Pilih Category", all_text_cols, key="cat_col_bar")
         with cc2:
             val_col = st.selectbox("Pilih Numeric", numeric_cols, key="cat_val_bar")
         with cc3:
@@ -1507,10 +1563,10 @@ with tabs[1]:
 # C. DISTRIBUTION
 # -----------------------------------------------------------------
 with tabs[2]:
-    if category_cols:
+    if all_text_cols:
         dc1, dc2 = st.columns(2)
         with dc1:
-            dist_col = st.selectbox("Pilih Category untuk Distribusi", category_cols, key="dist_col")
+            dist_col = st.selectbox("Pilih Category untuk Distribusi", all_text_cols, key="dist_col")
         with dc2:
             dist_value_options = ["Jumlah Baris (Count)"] + numeric_cols
             dist_value_choice = st.selectbox(
@@ -1640,7 +1696,7 @@ with tabs[4]:
             y_default_idx = 1 if len(numeric_cols) > 1 else 0
             y_col = st.selectbox("Sumbu Y", numeric_cols, index=y_default_idx, key="scatter_y")
 
-        color_arg = category_cols[0] if category_cols else None
+        color_arg = all_text_cols[0] if all_text_cols else None
         fig_scatter = px.scatter(
             df_filtered, x=x_col, y=y_col, color=color_arg,
             title=f"{x_col} vs {y_col}",
@@ -1659,12 +1715,12 @@ with tabs[5]:
         "(misal Domestik vs Ekspor, Aktif vs Nonaktif, atau apapun sesuai isi file), "
         "lalu breakdown salah satu kelompoknya lebih detail per sub-kategori dengan warna berbeda."
     )
-    if category_cols and numeric_cols:
+    if all_text_cols and numeric_cols:
         gc1, gc2 = st.columns(2)
         with gc1:
             group_class_col = st.selectbox(
                 "Kolom Klasifikasi (untuk membagi 2 kelompok)",
-                options=category_cols,
+                options=all_text_cols,
                 key="group_class_col",
                 help="Kolom kategori yang mau dipakai buat misahin data jadi 2 kelompok, "
                      "misal kolom Region, Tipe, Status, dll.",
@@ -1688,7 +1744,7 @@ with tabs[5]:
             key="group_a_selected_values",
         )
 
-        other_category_cols = [c for c in category_cols if c != group_class_col]
+        other_category_cols = [c for c in all_text_cols if c != group_class_col]
         group_sub_col = None
         if other_category_cols:
             group_sub_col = st.selectbox(
