@@ -795,7 +795,7 @@ with st.expander("🧭 Cek & Atur Baris Header (kalau ada kolom 'Unnamed' / tota
     st.dataframe(raw_preview, use_container_width=True)
     header_row = st.number_input(
         "Baris ke berapa (mulai dari 0) yang jadi header?",
-        min_value=0, max_value=9, value=guessed_header_row, step=1,
+        min_value=0, max_value=100, value=guessed_header_row, step=1,
     )
     st.markdown("---")
     st.caption(
