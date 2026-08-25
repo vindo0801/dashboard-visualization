@@ -19,6 +19,7 @@ Cara jalankan:
 import io
 import re
 import calendar
+import datetime
 
 import numpy as np
 import pandas as pd
@@ -81,6 +82,18 @@ st.markdown(CUSTOM_CSS, unsafe_allow_html=True)
 MONTH_ORDER = list(calendar.month_name)[1:]  # January..December
 MONTH_ALIAS = {m.lower(): i + 1 for i, m in enumerate(MONTH_ORDER)}
 MONTH_ALIAS.update({m[:3].lower(): i + 1 for i, m in enumerate(MONTH_ORDER)})
+
+# Nama bulan Bahasa Indonesia juga dikenali (banyak file Excel Indonesia
+# pakai 'Januari', 'Februari', dst, bukan nama bulan Inggris) - ini yang
+# bikin kolom Month kedetect tapi filternya kosong/ga muncul sebelumnya.
+MONTH_ALIAS_ID = [
+    "januari", "februari", "maret", "april", "mei", "juni",
+    "juli", "agustus", "september", "oktober", "november", "desember",
+]
+MONTH_ALIAS.update({m: i + 1 for i, m in enumerate(MONTH_ALIAS_ID)})
+MONTH_ALIAS.update({m[:3]: i + 1 for i, m in enumerate(MONTH_ALIAS_ID)})
+# Singkatan umum yang beda dari 3-huruf standar
+MONTH_ALIAS.update({"agt": 8, "ags": 8, "des": 12, "nov": 11, "okt": 10})
 
 CATEGORY_MAX_UNIQUE = 200
 MAX_NUMERIC_SLIDERS = 20
@@ -235,6 +248,16 @@ def detect_date_columns(df: pd.DataFrame) -> list:
             converted = pd.to_datetime(df[col], errors="coerce")
             valid_ratio = converted.notna().sum() / max(df[col].notna().sum(), 1)
             if valid_ratio >= 0.7 and converted.notna().sum() > 0:
+                # PENTING: pandas.to_datetime salah nge-parse nama bulan
+                # polos (misal 'Jan', 'Feb', 'December') jadi tanggal
+                # dengan tahun DEFAULT 0001 (karena ga ada info tahun
+                # beneran) - misal 'Jan' -> 0001-01-01. Kalau semua hasil
+                # parse-nya punya tahun 1 yang sama, ini BUKAN kolom
+                # tanggal beneran (kemungkinan besar kolom bulan/Month
+                # yang ke-detect ganda), jadi di-skip dari date_cols.
+                valid_years = converted.dropna().dt.year
+                if not valid_years.empty and valid_years.nunique() == 1 and valid_years.iloc[0] == 1:
+                    continue
                 date_cols.append(col)
         except Exception:
             continue
@@ -278,14 +301,31 @@ def detect_month_columns(df: pd.DataFrame) -> list:
 
 
 def month_to_number(val):
-    """Konversi nilai bulan (nama atau angka) menjadi angka 1-12."""
+    """Konversi nilai bulan (nama, angka, ATAU tanggal penuh) menjadi
+    angka 1-12. Kalau kolom 'Month' ternyata isinya tanggal lengkap
+    (misal '2024-01-01' atau objek Timestamp/date), otomatis diambil
+    bagian bulannya saja - jadi filter tetap tampil 'January' dkk,
+    bukan tanggal mentah 'yyyy-mm-dd'."""
     if pd.isna(val):
         return np.nan
     if isinstance(val, (int, float, np.integer, np.floating)):
         v = int(val)
         return v if 1 <= v <= 12 else np.nan
+    if isinstance(val, (pd.Timestamp, datetime.date, datetime.datetime)):
+        return val.month
     s = str(val).strip().lower()
-    return MONTH_ALIAS.get(s, np.nan)
+    if s in MONTH_ALIAS:
+        return MONTH_ALIAS[s]
+    # Kalau isinya angka dalam bentuk teks, misal "5" atau "05"
+    if s.isdigit():
+        v = int(s)
+        return v if 1 <= v <= 12 else np.nan
+    # Kalau isinya string tanggal lengkap (misal "2024-01-01", "01/02/2024",
+    # "Jan-2024") - coba parse jadi tanggal, lalu ambil bulannya.
+    parsed = pd.to_datetime(val, errors="coerce")
+    if pd.notna(parsed):
+        return parsed.month
+    return np.nan
 
 
 def detect_category_columns(df: pd.DataFrame, exclude: list) -> list:
@@ -423,12 +463,35 @@ def show_unit_note(col_name: str) -> None:
         st.caption(f"📏 Satuan terdeteksi dari nama kolom **{col_name}**: *in {unit}*")
 
 
-# Kata skala yang dikenali (Indonesia & Inggris) beserta pengalinya.
+# Kata skala yang dikenali (Indonesia & Inggris) beserta pengalinya - termasuk
+# singkatan umum yang biasa dipakai di laporan komoditas/trade (batu bara,
+# minyak, dll), misal 'mn t' (million ton), 'bn t' (billion ton).
 SCALE_WORDS = {
-    "thousand": 1_000, "ribu": 1_000,
-    "million": 1_000_000, "juta": 1_000_000,
+    "thousand": 1_000, "ribu": 1_000, "th": 1_000, "k": 1_000,
+    "million": 1_000_000, "juta": 1_000_000, "mn": 1_000_000, "mio": 1_000_000,
     "billion": 1_000_000_000, "miliar": 1_000_000_000, "milyar": 1_000_000_000,
+    "bn": 1_000_000_000, "bio": 1_000_000_000,
 }
+# Diurutkan dari yang paling panjang, dipakai buat cek token GABUNGAN tanpa
+# spasi (misal 'mnt' = 'mn' + 't', 'bnusd' = 'bn' + 'usd'). SENGAJA cuma
+# singkatan yang cukup panjang & ga ambigu ('mn','bn','mio','bio') - huruf
+# tunggal kayak 'k'/'th' DIKECUALIKAN dari mode gabungan ini karena rawan
+# ketuker sama awalan satuan umum yang sudah lazim (misal 'kg' kilogram,
+# 'km' kilometer, 'kt' kiloton) - itu tetap dibaca sebagai satuan utuh,
+# bukan dipecah jadi 'ribu + g/m/t'.
+_SAFE_COMBINED_PREFIXES = ["million", "billion", "thousand", "mio", "bio", "mn", "bn"]
+_SCALE_PREFIXES_BY_LEN = sorted(_SAFE_COMBINED_PREFIXES, key=len, reverse=True)
+
+
+def _split_scale_prefix(token: str):
+    """Coba pisahkan token gabungan macam 'mnt' -> ('mn', 't')."""
+    tl = token.lower()
+    for prefix in _SCALE_PREFIXES_BY_LEN:
+        if tl.startswith(prefix) and len(tl) > len(prefix):
+            rest = token[len(prefix):]
+            if rest.isalpha():
+                return prefix, rest
+    return None, None
 
 
 def parse_unit_parts(unit_text: str):
@@ -436,6 +499,8 @@ def parse_unit_parts(unit_text: str):
     Misal: 'Million MT' -> (1_000_000, 'Million', 'MT')
            'MT'         -> (None, None, 'MT')
            'USD Thousand' -> (1_000, 'Thousand', 'USD')
+           'mn t'       -> (1_000_000, 'mn', 't')
+           'mnt'        -> (1_000_000, 'mn', 't')   (token gabungan tanpa spasi)
     Kalau ga ada kata skala di teksnya, skala_eksplisit = None (artinya
     data MASIH angka mentah/asli, belum di-scale)."""
     if not unit_text:
@@ -446,13 +511,19 @@ def parse_unit_parts(unit_text: str):
         if key in SCALE_WORDS:
             rest = " ".join(tokens[:i] + tokens[i + 1:]).strip()
             return SCALE_WORDS[key], tok, rest
+        # Coba token gabungan tanpa spasi, misal 'mnt' -> scale 'mn' + sisa 't'
+        prefix, rest_of_token = _split_scale_prefix(tok)
+        if prefix:
+            rest_tokens = tokens[:i] + ([rest_of_token] if rest_of_token else []) + tokens[i + 1:]
+            rest = " ".join(rest_tokens).strip()
+            return SCALE_WORDS[prefix], prefix, rest
     return None, None, unit_text
 
 
 def auto_scale_factor(max_abs_value: float):
     """Auto-detect pembagi (Thousand/Million/Billion) berdasarkan besarnya
     angka, supaya angka yang ditampilkan di chart lebih ringkas & gampang
-    dibaca (misal 22.000.123 jadi 22.000 dengan keterangan 'In Thousand').
+    dibaca (misal 22.000.123 jadi 22.000 dengan keterangan 'In Th').
     Angka kecil (< 1.000) ga di-scale sama sekali."""
     if max_abs_value is None or pd.isna(max_abs_value) or max_abs_value == 0:
         return 1, ""
@@ -466,21 +537,48 @@ def auto_scale_factor(max_abs_value: float):
     return 1, ""
 
 
+# Bentuk singkat buat caption satuan di chart - lebih presentable & lazim
+# dipakai di laporan komoditas/trade (misal 'Mn T' = Million Ton), daripada
+# nulis lengkap 'Million'/'Billion'/'Thousand'.
+SCALE_ABBREV = {1_000: "Th", 1_000_000: "Mn", 1_000_000_000: "Bn"}
+# Huruf depan yang dianggap "redundan" kalau base unit-nya diawali huruf
+# yang sama dengan skala yang UDAH kesebut duluan di caption - misal skala
+# 'Million' + unit 'MT' -> 'M' di depan 'MT' jadi dobel nyebut Million,
+# jadi dibuang sisain 'T' aja. Cuma berlaku utk Million/Billion - BUKAN
+# Thousand, karena 'KT' (kiloton) itu satuan valid tersendiri, bukan
+# redundan, jadi ga boleh ikut dipotong.
+_REDUNDANT_SCALE_LETTER = {1_000_000: "m", 1_000_000_000: "b"}
+
+
+def _strip_redundant_scale_letter(base_unit: str, scale_val: int) -> str:
+    """Buang huruf depan base_unit kalau itu dobel nyebut skala yang udah
+    ada di caption (misal 'MT' + skala Million -> 'T')."""
+    letter = _REDUNDANT_SCALE_LETTER.get(scale_val)
+    if not letter or not base_unit or len(base_unit) <= 1:
+        return base_unit
+    if base_unit[0].lower() == letter:
+        return base_unit[1:]
+    return base_unit
+
+
 def get_display_scale(col_name: str, series: pd.Series):
     """Tentukan (divisor, caption) buat nampilin angka kolom `col_name`
     dengan data `series` di chart:
-    - Kalau nama kolom SUDAH eksplisit nyebut skala (misal 'Volume (Million MT)'),
-      dianggap datanya SUDAH dalam skala itu -> ga dibagi lagi (divisor=1),
-      caption langsung dari situ: 'In Million MT'.
+    - Kalau nama kolom SUDAH eksplisit nyebut skala (misal 'Volume (Million MT)'
+      atau 'Volume (mn t)'), dianggap datanya SUDAH dalam skala itu -> ga
+      dibagi lagi (divisor=1), caption disingkat & dibersihkan jadi
+      'In Mn T' (bukan 'In Million MT' yang lebih panjang).
     - Kalau BELUM ada skala eksplisit (misal cuma 'Volume (MT)' atau 'Volume'
       dengan angka mentah besar seperti 22.000.123), auto-detect skala yang
       pas dari besarnya angka, angkanya DIBAGI biar ringkas, caption jadi
-      misal 'In Thousand MT' - inilah yang bikin '22.000.123' -> '22.000'."""
+      misal 'In Th MT' - inilah yang bikin '22.000.123' -> '22.000'."""
     unit_text = detect_column_unit(col_name)
     explicit_scale_val, explicit_scale_word, base_unit = parse_unit_parts(unit_text)
 
     if explicit_scale_val:
-        caption = f"In {explicit_scale_word} {base_unit}".strip()
+        abbrev = SCALE_ABBREV.get(explicit_scale_val, explicit_scale_word)
+        trimmed_unit = _strip_redundant_scale_letter(base_unit, explicit_scale_val)
+        caption = f"In {abbrev} {trimmed_unit}".strip()
         return 1, caption
 
     max_abs = series.abs().max() if series is not None and len(series) else None
@@ -488,7 +586,9 @@ def get_display_scale(col_name: str, series: pd.Series):
     if auto_div == 1:
         return 1, (f"In {base_unit}" if base_unit else "")
 
-    caption = f"In {auto_label}" + (f" {base_unit}" if base_unit else "")
+    abbrev = SCALE_ABBREV.get(auto_div, auto_label)
+    trimmed_unit = _strip_redundant_scale_letter(base_unit, auto_div)
+    caption = f"In {abbrev}" + (f" {trimmed_unit}" if trimmed_unit else "")
     return auto_div, caption
 
 
@@ -540,9 +640,8 @@ def show_chart(
        tulisan kepotong/pecah).
     `n_categories`: jumlah kategori/slice/bar, dipakai buat nentuin tinggi
     chart & apakah label sumbu-X perlu dimiringkan biar ga tabrakan.
-    `unit_caption`: kalau diisi (misal 'In Thousand MT'), ditampilkan
-    sebagai anotasi kecil di pojok kiri atas chart - persis kayak
-    keterangan satuan di pojok chart pada umumnya."""
+    `unit_caption`: kalau diisi (misal 'In Mn T'), digabung jadi SUBTITLE
+    rapi di bawah judul chart (bukan anotasi terpisah yang bisa numpuk)."""
     fig.update_layout(
         font=dict(size=15),
         title_font=dict(size=19),
@@ -573,12 +672,18 @@ def show_chart(
         fig.update_layout(margin=dict(l=90, r=90, t=90, b=90))
 
     if unit_caption:
-        fig.add_annotation(
-            text=unit_caption,
-            xref="paper", yref="paper",
-            x=0, y=1.12, xanchor="left", yanchor="bottom",
-            showarrow=False,
-            font=dict(size=13, color="#555555"),
+        # Subtitle resmi di bawah judul (bukan anotasi terpisah) - supaya
+        # selalu rapi & ga akan tabrakan sama judul chart apapun panjangnya.
+        current_title = ""
+        if fig.layout.title and fig.layout.title.text:
+            current_title = fig.layout.title.text
+        height += 26
+        fig.update_layout(
+            title=dict(
+                text=f"{current_title}<br><span style='font-size:13px;color:#666666'>{unit_caption}</span>",
+            ),
+            height=height,
+            margin=dict(t=(fig.layout.margin.t or 70) + 26),
         )
 
     st.plotly_chart(
@@ -610,7 +715,7 @@ def render_full_vs_others_pies(
     lebih lega dan ga kepotong.
     `unit_source_col`: nama kolom numeric ASLI (buat deteksi satuan &
     auto-scale angka gede, misal 22.000.123 -> 22.000 + caption
-    'In Thousand MT'). Isi None kalau value_col bukan kolom angka asli
+    'In Th MT'). Isi None kalau value_col bukan kolom angka asli
     (misal lagi hitung Jumlah Baris)."""
     data, unit_caption = scale_for_display(data, value_col, unit_source_col)
     n_max = max(len(data), len(group_selected_as_others(data, label_col, value_col, others_selected)))
@@ -1133,59 +1238,68 @@ with st.sidebar:
         if year_values:
             with st.expander("📅 Year Filter", expanded=True):
                 selected_years = st.multiselect(
-                    "Pilih Tahun", options=year_values, default=year_values
+                    "Pilih Tahun", options=year_values, default=year_values,
+                    # Key diikat ke ISI datanya - supaya kalau ganti file
+                    # (range tahunnya beda), widget otomatis reset ke
+                    # default penuh, bukan nyangkut pilihan file lama yang
+                    # bisa bikin semua baris ke-filter habis.
+                    key=f"year_filter_{year_col}_{len(year_values)}_{year_values[0]}_{year_values[-1]}",
                 )
             if selected_years:
                 df_filtered = df_filtered[df_filtered[year_col].isin(selected_years)]
 
     # -----------------------------------------------------------------
-    # A. TIME FILTER - Month
+    # A. TIME FILTER - Month (robust: dukung nama bulan Indonesia/Inggris,
+    # singkatan, angka 1-12, DAN kolom yang isinya tanggal lengkap seperti
+    # '2024-01-01' - otomatis diambil bulannya saja tanpa bug).
     # -----------------------------------------------------------------
     if month_cols:
         month_col = month_cols[0]
         raw_month_values = df_raw[month_col].dropna().unique().tolist()
 
-        # Normalisasi ke nama bulan standar untuk urutan yang benar
         def _to_month_name(v):
             num = month_to_number(v)
             if pd.isna(num):
                 return None
             return MONTH_ORDER[int(num) - 1]
 
-        month_name_map = {v: _to_month_name(v) for v in raw_month_values}
-        ordered_months = sorted(
-            set(m for m in month_name_map.values() if m is not None),
-            key=lambda m: MONTH_ORDER.index(m),
-        )
-        if ordered_months:
-            with st.expander("🗓️ Month Filter", expanded=True):
-                selected_months = st.multiselect(
-                    "Pilih Bulan", options=ordered_months, default=ordered_months
-                )
-            if selected_months:
-                allowed_raw_vals = [
-                    raw for raw, name in month_name_map.items() if name in selected_months
-                ]
-                df_filtered = df_filtered[df_filtered[month_col].isin(allowed_raw_vals)]
+        # display_name: nama bulan standar (Januari, Februari, dst) kalau
+        # nilainya kekenali (termasuk singkatan "Jan"/"Feb"/"Mar" versi
+        # Inggris maupun Indonesia, atau bahkan tanggal penuh yang otomatis
+        # diambil bulannya). Kalau ga kekenali formatnya, PAKAI NILAI
+        # ASLINYA APA ADANYA sebagai nama tampilan - supaya SEMUA nilai
+        # selalu muncul di filter, ga ada yang hilang/ke-skip.
+        display_map = {v: (_to_month_name(v) or str(v)) for v in raw_month_values}
 
-    # -----------------------------------------------------------------
-    # A. TIME FILTER - Date Range
-    # -----------------------------------------------------------------
-    if date_cols:
-        date_col = date_cols[0]
-        valid_dates = df_raw[date_col].dropna()
-        if not valid_dates.empty:
-            min_date, max_date = valid_dates.min().date(), valid_dates.max().date()
-            with st.expander("📆 Date Range Filter", expanded=False):
-                date_range = st.date_input(
-                    "Rentang Tanggal", value=(min_date, max_date),
-                    min_value=min_date, max_value=max_date,
+        def _sort_key(v):
+            name = display_map[v]
+            if name in MONTH_ORDER:
+                return (0, MONTH_ORDER.index(name))
+            return (1, name)
+
+        raw_sorted = sorted(raw_month_values, key=_sort_key)
+        options_display = []
+        seen_display = set()
+        for v in raw_sorted:
+            d = display_map[v]
+            if d not in seen_display:
+                seen_display.add(d)
+                options_display.append(d)
+
+        if options_display:
+            with st.expander("🗓️ Month Filter", expanded=True):
+                selected_months_display = st.multiselect(
+                    "Pilih Bulan", options=options_display, default=options_display,
+                    # Key diikat ke ISI datanya (jumlah opsi + opsi pertama) -
+                    # supaya kalau ganti file Excel (bulan yang muncul beda),
+                    # widget otomatis reset ke default penuh, BUKAN nyangkut
+                    # pilihan lama dari file sebelumnya yang bisa bikin
+                    # semua baris ke-filter habis ("Tidak ada data yang cocok").
+                    key=f"month_filter_{month_col}_{len(options_display)}_{options_display[0]}",
                 )
-            if isinstance(date_range, tuple) and len(date_range) == 2:
-                start_d, end_d = date_range
-                mask = (df_filtered[date_col].dt.date >= start_d) & \
-                       (df_filtered[date_col].dt.date <= end_d)
-                df_filtered = df_filtered[mask | df_filtered[date_col].isna()]
+            if selected_months_display:
+                allowed_raw_vals = [v for v in raw_month_values if display_map[v] in selected_months_display]
+                df_filtered = df_filtered[df_filtered[month_col].isin(allowed_raw_vals)]
 
     # -----------------------------------------------------------------
     # B. CATEGORY FILTER (checkbox) - SENGAJA tetap pakai category_cols
@@ -1200,7 +1314,10 @@ with st.sidebar:
                 options = sorted(df_raw[col].dropna().astype(str).unique().tolist())
                 if len(options) == 0:
                     continue
-                selected_vals = st.multiselect(f"{col}", options=options, default=options)
+                selected_vals = st.multiselect(
+                    f"{col}", options=options, default=options,
+                    key=f"cat_filter_{col}_{len(options)}",
+                )
                 if selected_vals and len(selected_vals) < len(options):
                     df_filtered = df_filtered[df_filtered[col].astype(str).isin(selected_vals)]
 
@@ -1219,6 +1336,12 @@ with st.sidebar:
                 sel_range = st.slider(
                     f"{col}", min_value=min_v, max_value=max_v,
                     value=(min_v, max_v),
+                    # Key diikat ke min/max ASLI data ini - supaya kalau
+                    # user ganti file Excel (range angkanya beda), slider
+                    # otomatis reset ke default penuh, BUKAN nyangkut nilai
+                    # lama yang bisa di luar range baru (yang bikin semua
+                    # baris ke-filter habis tanpa disadari).
+                    key=f"num_filter_{col}_{round(min_v, 6)}_{round(max_v, 6)}",
                 )
                 df_filtered = df_filtered[
                     df_filtered[col].between(sel_range[0], sel_range[1]) | df_filtered[col].isna()
@@ -1541,17 +1664,33 @@ with tabs[1]:
 
         b1, b2 = st.columns(2)
         with b1:
+            # Judul default SAMA seperti sebelumnya ("{cat_col} vs Total {val_col}"),
+            # tapi sekarang bisa diedit bebas lewat kotak input di bawah.
+            default_title_left = f"{cat_col} vs Total {val_col}"
+            edited_title_left = st.text_input(
+                "✏️ Judul Chart (bisa diedit)", value=default_title_left,
+                key=f"chart_title_left_{cat_col}_{val_col}",
+                help="Judul otomatis ke-generate dari kolom yang dipilih, tapi bisa diubah bebas sesuai kebutuhan.",
+            )
             fig_bar = px.bar(
                 cat_agg_scaled, x=cat_col, y=val_col,
-                title=f"{cat_col} vs Total {val_col}",
+                title=edited_title_left or default_title_left,
             )
             show_chart(fig_bar, n_categories=len(cat_agg), unit_caption=cat_unit_caption)
         with b2:
             top_n_data = cat_agg.head(top_n).sort_values(val_col)
             top_n_data_scaled, top_n_unit_caption = scale_for_display(top_n_data, val_col, val_col)
+            # Judul default SAMA seperti sebelumnya ("Top N {cat_col} by {val_col}"),
+            # juga bisa diedit bebas.
+            default_title_right = f"Top {top_n} {cat_col} by {val_col}"
+            edited_title_right = st.text_input(
+                "✏️ Judul Chart (bisa diedit)", value=default_title_right,
+                key=f"chart_title_right_{cat_col}_{val_col}_{top_n}",
+                help="Judul otomatis ke-generate dari kolom yang dipilih, tapi bisa diubah bebas sesuai kebutuhan.",
+            )
             fig_hbar = px.bar(
                 top_n_data_scaled, x=val_col, y=cat_col, orientation="h",
-                title=f"Top {top_n} {cat_col} by {val_col}",
+                title=edited_title_right or default_title_right,
                 text=val_col,
             )
             fig_hbar.update_traces(texttemplate="%{text:,.2~f}", textposition="outside")
