@@ -1595,60 +1595,12 @@ st.markdown("---")
 
 st.markdown("## 📈 Visualization")
 
-# Tentukan sumbu waktu terbaik yang tersedia (date > year+month > year)
-time_axis_col = None
-time_axis_type = None
-df_viz = df_filtered.copy()
-
-if date_cols:
-    time_axis_col = date_cols[0]
-    time_axis_type = "date"
-elif year_cols and month_cols:
-    y_col, m_col = year_cols[0], month_cols[0]
-    df_viz["_month_num"] = df_viz[m_col].apply(month_to_number)
-    df_viz["_time_period"] = pd.to_datetime(
-        df_viz[y_col].astype("Int64").astype(str) + "-" +
-        df_viz["_month_num"].fillna(1).astype(int).astype(str) + "-01",
-        errors="coerce",
-    )
-    time_axis_col = "_time_period"
-    time_axis_type = "date"
-elif year_cols:
-    time_axis_col = year_cols[0]
-    time_axis_type = "year"
-
-tabs = st.tabs(["⏱️ Time Trend", "🏷️ Category", "📉 Distribution", "🔢 Numeric", "🔗 Relationship", "⚖️ Group Comparison"])
+tabs = st.tabs(["🏷️ Category", "📉 Distribution", "🔢 Numeric", "🔗 Relationship", "⚖️ Group Comparison"])
 
 # -----------------------------------------------------------------
-# A. TIME TREND
+# A. CATEGORY ANALYSIS
 # -----------------------------------------------------------------
 with tabs[0]:
-    if time_axis_col and numeric_cols:
-        value_col = st.selectbox("Pilih Numeric untuk Trend", numeric_cols, key="trend_value")
-        agg_df = df_viz.groupby(time_axis_col, as_index=False)[value_col].sum()
-        agg_df = agg_df.sort_values(time_axis_col)
-        agg_df_scaled, trend_unit_caption = scale_for_display(agg_df, value_col, value_col)
-
-        c1, c2 = st.columns(2)
-        with c1:
-            fig_line = px.line(
-                agg_df_scaled, x=time_axis_col, y=value_col, markers=True,
-                title=f"{value_col} over Time",
-            )
-            show_chart(fig_line, n_categories=len(agg_df), unit_caption=trend_unit_caption)
-        with c2:
-            fig_area = px.area(
-                agg_df_scaled, x=time_axis_col, y=value_col,
-                title=f"{value_col} over Time (Area)",
-            )
-            show_chart(fig_area, n_categories=len(agg_df), unit_caption=trend_unit_caption)
-    else:
-        st.info("Tidak ditemukan kombinasi kolom waktu (date/year/month) dan numeric yang cukup untuk Time Trend.")
-
-# -----------------------------------------------------------------
-# B. CATEGORY ANALYSIS
-# -----------------------------------------------------------------
-with tabs[1]:
     if all_text_cols and numeric_cols:
         cc1, cc2, cc3 = st.columns(3)
         with cc1:
@@ -1699,9 +1651,9 @@ with tabs[1]:
         st.info("Tidak ditemukan kombinasi kolom category dan numeric untuk Category Analysis.")
 
 # -----------------------------------------------------------------
-# C. DISTRIBUTION
+# B. DISTRIBUTION
 # -----------------------------------------------------------------
-with tabs[2]:
+with tabs[1]:
     if all_text_cols:
         dc1, dc2 = st.columns(2)
         with dc1:
@@ -1807,9 +1759,9 @@ with tabs[2]:
         st.info("Tidak ditemukan kolom category untuk chart distribusi.")
 
 # -----------------------------------------------------------------
-# D. NUMERIC ANALYSIS
+# C. NUMERIC ANALYSIS
 # -----------------------------------------------------------------
-with tabs[3]:
+with tabs[2]:
     if numeric_cols:
         num_col = st.selectbox("Pilih Numeric Column", numeric_cols, key="num_analysis_col")
         show_unit_note(num_col)
@@ -1824,9 +1776,9 @@ with tabs[3]:
         st.info("Tidak ditemukan kolom numeric untuk analisis distribusi numerik.")
 
 # -----------------------------------------------------------------
-# E. RELATIONSHIP
+# D. RELATIONSHIP
 # -----------------------------------------------------------------
-with tabs[4]:
+with tabs[3]:
     if len(numeric_cols) >= 2:
         r1, r2 = st.columns(2)
         with r1:
@@ -1845,10 +1797,10 @@ with tabs[4]:
         st.info("Minimal dibutuhkan 2 kolom numeric untuk membuat Scatter Plot.")
 
 # -----------------------------------------------------------------
-# F. GROUP COMPARISON (generic - berlaku untuk kolom & nilai apapun,
+# E. GROUP COMPARISON (generic - berlaku untuk kolom & nilai apapun,
 # tidak terikat ke istilah/kasus bisnis tertentu)
 # -----------------------------------------------------------------
-with tabs[5]:
+with tabs[4]:
     st.caption(
         "Bagi data jadi 2 kelompok berdasarkan kolom & nilai pilihan kamu sendiri "
         "(misal Domestik vs Ekspor, Aktif vs Nonaktif, atau apapun sesuai isi file), "
