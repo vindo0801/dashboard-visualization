@@ -235,6 +235,115 @@ def try_convert_numeric(df: pd.DataFrame, assume_dot_comma_as_thousands: bool = 
     return df
 
 
+# Jumlah minimum kolom ber-nama-tanggal supaya dianggap "wide time-series"
+# beneran (bukan cuma kebetulan ada 1-2 kolom bernama tanggal).
+WIDE_PERIOD_MIN_COLS = 6
+
+
+def detect_wide_period_columns(df: pd.DataFrame):
+    """Deteksi kolom-kolom yang NAMA-nya sendiri berupa tanggal/periode
+    (misal header kolom '2000-01-01', '2000-02-01', dst - satu kolom per
+    bulan/periode/tahun). Ini format WIDE yang umum dipakai laporan trade/
+    statistik (misal Global Trade Tracker, BPS, data ekspor-impor): tiap
+    baris = 1 kombinasi kategori, tiap kolom = 1 titik waktu, isinya angka.
+    Mendukung 2 granularitas:
+    - 'date': header kolom berupa tanggal lengkap (misal sheet bulanan)
+    - 'year': header kolom berupa angka tahun murni (misal sheet tahunan,
+      contoh header '2000', '2001', dst - TANPA info bulan)
+    Kalau jumlah kolom seperti ini banyak (>= WIDE_PERIOD_MIN_COLS),
+    dashboard akan otomatis 'unpivot' (melt) supaya bisa dianalisis
+    dengan fitur filter tanggal/tahun/tren yang sama seperti data format
+    panjang biasa - generic, berlaku untuk sheet Excel apapun dengan pola
+    ini, bukan cuma untuk 1 file tertentu.
+    Return (granularity, period_cols) - granularity None kalau ga kedetect."""
+    date_period_cols = []
+    year_period_cols = []
+    for col in df.columns:
+        if isinstance(col, (pd.Timestamp, datetime.date, datetime.datetime)):
+            date_period_cols.append(col)
+            continue
+        col_str = str(col).strip()
+        # Cocok kalau nama kolom BENAR-BENAR berpola tanggal (bukan sekadar
+        # angka biasa) - misal '2000-01-01', '2000-01', 'Jan-2000', 'Jan 2000'.
+        # Toleran terhadap komponen jam (misal '2000-01-01 00:00:00' atau
+        # '2000-01-01T00:00:00') supaya kolom header bertipe datetime yang
+        # SUDAH terlanjur berubah jadi teks (misal lewat str()/to_string())
+        # tetap kedetect dengan benar, bukan cuma yang masih objek datetime asli.
+        looks_like_date = bool(
+            re.match(r"^\d{4}[-/]\d{1,2}(?:[-/]\d{1,2})?(?:[ T]\d{1,2}:\d{2}(?::\d{2})?)?$", col_str)
+            or re.match(r"^[A-Za-z]{3,9}[\s\-]\d{2,4}$", col_str)
+        )
+        if looks_like_date:
+            parsed = pd.to_datetime(col_str, errors="coerce")
+            if pd.notna(parsed):
+                date_period_cols.append(col)
+                continue
+        # Cek pola TAHUN MURNI (misal header berupa angka 2000, 2000.0,
+        # atau string '2000') - dipakai kalau sheet-nya wide-format tahunan.
+        year_val = None
+        if isinstance(col, (int, float, np.integer, np.floating)) and not isinstance(col, bool):
+            if float(col).is_integer():
+                year_val = int(col)
+        elif re.fullmatch(r"(19|20)\d{2}", col_str):
+            year_val = int(col_str)
+        elif re.fullmatch(r"(19|20)\d{2}\.0", col_str):
+            # Header tahun bertipe float yang sudah kadung di-str()-kan,
+            # misal '2000.0' (dari kolom Excel bertipe float 2000.0).
+            year_val = int(float(col_str))
+        if year_val is not None and 1900 <= year_val <= 2100:
+            year_period_cols.append(col)
+
+    if len(date_period_cols) >= WIDE_PERIOD_MIN_COLS:
+        return "date", date_period_cols
+    if len(year_period_cols) >= WIDE_PERIOD_MIN_COLS:
+        return "year", year_period_cols
+    return None, []
+
+
+def detect_sheet_unit_hint(file_bytes: bytes, sheet_name, header_row: int) -> str:
+    """Coba cari keterangan satuan (misal '(Tonnes)') dari baris-baris DI
+    ATAS baris header - banyak laporan trade/statistik nulis satuan di
+    situ, terpisah dari nama kolom. Return '' kalau ga ketemu apapun."""
+    if header_row <= 0:
+        return ""
+    try:
+        preview = pd.read_excel(io.BytesIO(file_bytes), sheet_name=sheet_name, header=None, nrows=header_row)
+    except Exception:
+        return ""
+    generic_words = {"source", "note", "notes", "data availability", "contents"}
+    for _, row in preview.iterrows():
+        for cell in row:
+            if isinstance(cell, str):
+                m = re.fullmatch(r"\(?\s*([A-Za-z][A-Za-z /]{1,25}?)\s*\)?", cell.strip())
+                if m:
+                    candidate = m.group(1).strip()
+                    if candidate.lower() not in generic_words and len(candidate) >= 2:
+                        return candidate
+    return ""
+
+
+def melt_wide_period_columns(
+    df: pd.DataFrame, period_cols: list, period_col_name: str, value_col_name: str, granularity: str = "date"
+) -> pd.DataFrame:
+    """Ubah kolom-kolom periode (format WIDE, 1 kolom = 1 titik waktu)
+    jadi format PANJANG (long format): 1 baris = 1 kombinasi
+    id + periode + nilai. Kolom id lain (misal 'Import country', 'First',
+    'Last') dipertahankan apa adanya. Setelah di-melt, dashboard bisa
+    langsung pakai fitur filter tanggal/bulan/tahun dan visualisasi tren
+    seperti data format panjang biasa.
+    `granularity`: 'date' (kolom hasil jadi datetime lengkap) atau
+    'year' (kolom hasil jadi angka tahun murni, buat sheet tahunan)."""
+    id_vars = [c for c in df.columns if c not in period_cols]
+    melted = df.melt(id_vars=id_vars, value_vars=period_cols, var_name=period_col_name, value_name=value_col_name)
+    if granularity == "date":
+        melted[period_col_name] = pd.to_datetime(melted[period_col_name], errors="coerce")
+    else:
+        melted[period_col_name] = pd.to_numeric(melted[period_col_name], errors="coerce")
+        melted = melted.dropna(subset=[period_col_name])
+        melted[period_col_name] = melted[period_col_name].astype(int)
+    return melted
+
+
 def detect_date_columns(df: pd.DataFrame) -> list:
     """Deteksi kolom yang mayoritas isinya bisa dikonversi ke datetime."""
     date_cols = []
@@ -803,6 +912,38 @@ def load_and_process(file_bytes: bytes, sheet_name, header_row: int = 0,
     """Load Excel dari bytes, bersihkan, dan jalankan auto-detection engine."""
     df = pd.read_excel(io.BytesIO(file_bytes), sheet_name=sheet_name, header=header_row)
 
+    # -----------------------------------------------------------------
+    # WIDE TIME-SERIES AUTO-UNPIVOT: kalau sheet-nya ternyata format WIDE
+    # (1 kolom = 1 bulan/periode, header-nya literal tanggal/tahun - umum
+    # di laporan trade/statistik seperti Global Trade Tracker/BPS), otomatis
+    # di-'melt' jadi format panjang (1 baris = 1 titik waktu) supaya bisa
+    # dipakai penuh oleh seluruh fitur dashboard (filter tanggal/bulan/
+    # tahun, KPI, chart). Generic - berlaku untuk sheet Excel manapun
+    # dengan pola wide time-series, bukan cuma 1 file tertentu.
+    #
+    # PENTING: ini HARUS dijalankan SEBELUM clean_column_names(), karena
+    # kalau header kolom aslinya berupa objek datetime asli (umum kalau
+    # Excel-nya nyimpen tanggal sebagai date cell, bukan teks), begitu
+    # clean_column_names() menjalankan str() ke nama kolom, objek datetime
+    # itu berubah jadi teks lengkap dengan jam (misal '2000-01-01 00:00:00')
+    # dan gagal dikenali lagi sebagai kolom periode. Makanya deteksi &
+    # unpivot dilakukan di sini dulu, memakai nama kolom ASLI/mentah.
+    # -----------------------------------------------------------------
+    wide_period_date_col = None
+    granularity, period_cols = detect_wide_period_columns(df)
+    if period_cols:
+        unit_hint = detect_sheet_unit_hint(file_bytes, sheet_name, header_row)
+        value_col_name = f"Value ({unit_hint})" if unit_hint else "Value"
+        wide_period_date_col = "Date"
+        df = melt_wide_period_columns(df, period_cols, wide_period_date_col, value_col_name, granularity)
+        # Baris yang nilainya kosong/'-' (ga ada transaksi tercatat di
+        # periode itu) dibuang - ga ngubah hasil TOTAL apapun (NaN memang
+        # diabaikan saat dijumlah/dirata-rata), tapi bikin dataset jauh
+        # lebih ringkas & dashboard tetap responsif walau sheet aslinya
+        # punya ratusan kolom periode.
+        df[value_col_name] = clean_numeric_string(df[value_col_name], assume_dot_comma_as_thousands)
+        df = df[df[value_col_name].notna()].reset_index(drop=True)
+
     df = clean_column_names(df)
     df = drop_empty_columns(df)
     df = rename_unnamed_columns(df)
@@ -822,8 +963,27 @@ def load_and_process(file_bytes: bytes, sheet_name, header_row: int = 0,
     for c in date_cols:
         df[c] = pd.to_datetime(df[c], errors="coerce")
 
+    # Kalau ada kolom tanggal hasil unpivot wide-format, itu yang PALING
+    # merepresentasikan waktu observasi sebenarnya (bukan kolom tanggal
+    # metadata lain yang mungkin ada di file, misal 'First'/'Last' yang
+    # cuma nunjukkin rentang ketersediaan data) - jadi diprioritaskan
+    # jadi date_cols[0] supaya turunan Year/Month otomatis ngikut ini.
+    if wide_period_date_col and wide_period_date_col in date_cols:
+        date_cols = [wide_period_date_col] + [c for c in date_cols if c != wide_period_date_col]
+
     year_cols = detect_year_columns(df)
     month_cols = detect_month_columns(df)
+
+    # Jika hasil unpivot-nya granularity 'year' (sheet tahunan, kolom
+    # 'Date' isinya angka tahun murni bukan tanggal lengkap), pastikan
+    # kolom itu diprioritaskan juga sebagai year_cols[0] - supaya Year
+    # Filter otomatis ngikut kolom hasil unpivot, bukan kolom lain
+    # (misal 'First'/'Last' - Year) yang cuma metadata ketersediaan data.
+    if wide_period_date_col and granularity == "year" and wide_period_date_col in df.columns:
+        if wide_period_date_col not in year_cols:
+            year_cols = [wide_period_date_col] + year_cols
+        else:
+            year_cols = [wide_period_date_col] + [c for c in year_cols if c != wide_period_date_col]
 
     # Jika hanya ada date column (tidak ada year/month eksplisit),
     # ekstrak otomatis Year, Month, Month Name dari date pertama.
@@ -1735,7 +1895,7 @@ with tabs[1]:
                     "Gabungkan kategori berikut jadi 'Others' (opsional)",
                     options=drill_data[drill_src_col].astype(str).tolist(),
                     key="others_selected_drill",
-                    help="Pilih kategori mana saja yang mau digabung jadi satu slice 'Others' di pie kanan.",
+                    help="Pilih kategori mana saja yang mau digabung jadi satu slice 'Others'.",
                 )
                 render_full_vs_others_pies(
                     drill_data, drill_src_col, "Value",
