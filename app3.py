@@ -813,9 +813,73 @@ def show_chart(
     )
 
 
+PIE_DEFAULT_PALETTE = px.colors.qualitative.Plotly
+
+
+def pick_pie_colors_and_pull(categories: list, section_key: str):
+    """Tampilkan kontrol interaktif (dalam expander) untuk kustomisasi pie
+    chart: warna sendiri per kategori, pilih slice mana yang mau "ditarik
+    keluar" (explode/pull), dan rotasi awal chart. `section_key` harus unik
+    per pemanggilan (misal nama tab + nama kolom) supaya widget & warna yang
+    diingat tidak bentrok/ketimpa dengan pie chart lain di tab lain.
+    Return: (color_map: dict, pull_categories: list, pull_amount: float, rotation_deg: int)
+    """
+    categories = [str(c) for c in categories]
+    color_map = {}
+    with st.expander(f"🎨 Kustomisasi Tampilan Pie Chart ({section_key})"):
+        st.caption(
+            "Pilih warna sendiri per kategori, tarik keluar (explode) slice tertentu "
+            "buat highlight, dan atur rotasi awal chart kalau perlu."
+        )
+        cc1, cc2 = st.columns([1, 1])
+        with cc1:
+            st.markdown("**Warna per kategori**")
+            color_grid = st.columns(3)
+            for i, cat in enumerate(categories):
+                default_color = PIE_DEFAULT_PALETTE[i % len(PIE_DEFAULT_PALETTE)]
+                widget_key = f"color_{section_key}_{cat}"
+                chosen = color_grid[i % 3].color_picker(cat, value=default_color, key=widget_key)
+                color_map[cat] = chosen
+        with cc2:
+            st.markdown("**Explode & Rotasi**")
+            pull_categories = st.multiselect(
+                "Tarik keluar (explode) slice ini",
+                options=categories,
+                key=f"pull_cats_{section_key}",
+                help="Slice yang dipilih akan sedikit 'ditarik keluar' dari lingkaran pie untuk menonjolkan fokus.",
+            )
+            pull_amount = 0.0
+            if pull_categories:
+                pull_amount = st.slider(
+                    "Besar tarikan slice", min_value=0.02, max_value=0.4, value=0.12, step=0.02,
+                    key=f"pull_amt_{section_key}",
+                )
+            rotation_deg = st.slider(
+                "Rotasi awal chart (derajat)", min_value=0, max_value=360, value=0, step=15,
+                key=f"rotation_{section_key}",
+                help="Mengubah posisi mulai slice pertama (jam 12 = 0 derajat). Murni estetika, tidak mengubah data.",
+            )
+    return color_map, pull_categories, pull_amount, rotation_deg
+
+
+def apply_pie_customization(fig, data: pd.DataFrame, label_col: str, color_map: dict = None,
+                             pull_categories: list = None, pull_amount: float = 0.0,
+                             rotation_deg: int = 0) -> None:
+    """Terapkan pull (explode) & rotation ke trace pie yang sudah dibuat px.pie.
+    Warna sudah diterapkan lewat color_discrete_map saat px.pie dipanggil, jadi
+    fungsi ini fokus ke pull & rotation yang butuh urutan data asli."""
+    pull_categories = pull_categories or []
+    if pull_categories and pull_amount:
+        pull_array = [pull_amount if str(v) in pull_categories else 0 for v in data[label_col]]
+        fig.update_traces(pull=pull_array)
+    if rotation_deg:
+        fig.update_traces(rotation=rotation_deg)
+
+
 def render_full_vs_others_pies(
     data: pd.DataFrame, label_col: str, value_col: str, title_prefix: str, others_selected: list,
-    unit_source_col: str = None,
+    unit_source_col: str = None, color_map: dict = None, pull_categories: list = None,
+    pull_amount: float = 0.0, rotation_deg: int = 0,
 ) -> None:
     """Tampilkan 2 pie chart perbandingan: kiri/atas versi FULL (semua
     kategori apa adanya), kanan/bawah versi dengan kategori terpilih
@@ -837,21 +901,31 @@ def render_full_vs_others_pies(
 
     with pc_full:
         st.caption("📊 Full (semua kategori)")
-        fig_full = px.pie(data, names=label_col, values=value_col, title=f"{title_prefix} - Full")
+        fig_full = px.pie(
+            data, names=label_col, values=value_col, title=f"{title_prefix} - Full",
+            color=label_col, color_discrete_map=color_map,
+        )
         fig_full.update_traces(
             textinfo="label+percent+value",
             texttemplate="%{label}<br>%{percent:.2%}<br>%{value:,.2~f}",
             hovertemplate="%{label}<br>Persentase: %{percent:.2%}<br>Nilai: %{value:,.2~f}<extra></extra>",
         )
+        apply_pie_customization(fig_full, data, label_col, color_map, pull_categories, pull_amount, rotation_deg)
         show_chart(fig_full, n_categories=len(data), is_pie=True, unit_caption=unit_caption)
     with pc_others:
         st.caption("🗂️ Dengan 'Others'")
         data_with_others = group_selected_as_others(data, label_col, value_col, others_selected)
-        fig_others = px.pie(data_with_others, names=label_col, values=value_col, title=f"{title_prefix} - Others")
+        fig_others = px.pie(
+            data_with_others, names=label_col, values=value_col, title=f"{title_prefix} - Others",
+            color=label_col, color_discrete_map=color_map,
+        )
         fig_others.update_traces(
             textinfo="label+percent+value",
             texttemplate="%{label}<br>%{percent:.2%}<br>%{value:,.2~f}",
             hovertemplate="%{label}<br>Persentase: %{percent:.2%}<br>Nilai: %{value:,.2~f}<extra></extra>",
+        )
+        apply_pie_customization(
+            fig_others, data_with_others, label_col, color_map, pull_categories, pull_amount, rotation_deg
         )
         show_chart(fig_others, n_categories=len(data_with_others), is_pie=True, unit_caption=unit_caption)
 
@@ -1569,13 +1643,21 @@ if active_grouped_cols:
                 )
                 fig_preview.update_traces(texttemplate="%{text:,.2~f}", textposition="outside")
             elif preview_chart_type == "Pie Chart":
+                preview_color_map, preview_pull_cats, preview_pull_amt, preview_rotation = pick_pie_colors_and_pull(
+                    preview_data_scaled[grouped_col].astype(str).tolist(), section_key=f"preview_{grouped_col}"
+                )
                 fig_preview = px.pie(
                     preview_data_scaled, names=grouped_col, values="Value", color=grouped_col,
+                    color_discrete_map=preview_color_map,
                     title=f"{preview_label} per {grouped_col}",
                 )
                 fig_preview.update_traces(
                     texttemplate="%{label}<br>%{percent:.2%}<br>%{value:,.2~f}",
                     hovertemplate="%{label}<br>Persentase: %{percent:.2%}<br>Nilai: %{value:,.2~f}<extra></extra>",
+                )
+                apply_pie_customization(
+                    fig_preview, preview_data_scaled, grouped_col, preview_color_map,
+                    preview_pull_cats, preview_pull_amt, preview_rotation,
                 )
             else:
                 preview_data_h = preview_data_scaled.sort_values("Value")
@@ -1844,9 +1926,14 @@ with tabs[1]:
             help="Pilih kategori mana saja yang mau digabung jadi satu slice 'Others' di pie kanan. "
                  "Pie kiri tetap tampil full tanpa 'Others'.",
         )
+        dist_color_map, dist_pull_cats, dist_pull_amt, dist_rotation = pick_pie_colors_and_pull(
+            dist_data[dist_col].astype(str).tolist(), section_key=f"dist_{dist_col}"
+        )
         render_full_vs_others_pies(
             dist_data, dist_col, "Value", f"Distribution of {dist_col} ({value_label})", others_selected_dist,
             unit_source_col=dist_unit_source,
+            color_map=dist_color_map, pull_categories=dist_pull_cats,
+            pull_amount=dist_pull_amt, rotation_deg=dist_rotation,
         )
 
         with st.expander("📋 Lihat angka detail per kategori"):
@@ -1897,11 +1984,17 @@ with tabs[1]:
                     key="others_selected_drill",
                     help="Pilih kategori mana saja yang mau digabung jadi satu slice 'Others'.",
                 )
+                drill_color_map, drill_pull_cats, drill_pull_amt, drill_rotation = pick_pie_colors_and_pull(
+                    drill_data[drill_src_col].astype(str).tolist(),
+                    section_key=f"drill_{selected_drill_group}_{drill_src_col}",
+                )
                 render_full_vs_others_pies(
                     drill_data, drill_src_col, "Value",
                     f"Rincian '{selected_drill_group}' per {drill_src_col} ({value_label})",
                     others_selected_drill,
                     unit_source_col=dist_unit_source,
+                    color_map=drill_color_map, pull_categories=drill_pull_cats,
+                    pull_amount=drill_pull_amt, rotation_deg=drill_rotation,
                 )
 
                 with st.expander(f"📋 Lihat angka detail rincian '{selected_drill_group}'"):
@@ -2044,11 +2137,17 @@ with tabs[4]:
                     help="Pilih kategori mana saja yang mau digabung jadi satu slice 'Others'.",
                 )
 
+                gcomp_color_map, gcomp_pull_cats, gcomp_pull_amt, gcomp_rotation = pick_pie_colors_and_pull(
+                    group_breakdown[group_sub_col].astype(str).tolist(),
+                    section_key=f"gcomp_{group_a_name}_{group_sub_col}",
+                )
                 render_full_vs_others_pies(
                     group_breakdown, group_sub_col, group_value_col,
                     f"Distribusi {group_a_name} per {group_sub_col}",
                     others_selected_comparison,
                     unit_source_col=group_value_col,
+                    color_map=gcomp_color_map, pull_categories=gcomp_pull_cats,
+                    pull_amount=gcomp_pull_amt, rotation_deg=gcomp_rotation,
                 )
 
                 group_breakdown_scaled, group_bar_unit_caption = scale_for_display(
